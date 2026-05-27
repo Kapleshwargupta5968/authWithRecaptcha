@@ -22,6 +22,18 @@ const userSchema = new mongoose.Schema({
     refreshToken:{
         type:String,
         required:false
+    },
+    twoFactorChallenge: {
+        type: Number,
+        default: null
+    },
+    twoFactorExpiresAt: {
+        type: Date,
+        default: null
+    },
+    is2FaVerified: {
+        type: Boolean,
+        default: false
     }
 },{
     timestamps:true

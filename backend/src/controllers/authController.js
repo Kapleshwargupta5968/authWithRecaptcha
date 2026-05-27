@@ -3,6 +3,7 @@ const User = require("../models/user");
 const generateToken = require("../utils/generateToken");
 const bcrypt = require("bcrypt");
 const axios = require("axios");
+const { send2FAEmail } = require("../utils/mailer");
 
 const signUp = async (req, res) => {
     try {
@@ -21,10 +22,13 @@ const signUp = async (req, res) => {
             }
         });
         const data = response?.data;
-        if (!data?.success) {
+        console.log("Google ReCAPTCHA verification response:", data);
+        if (!data?.success || data.score < 0.5) {
             return res.status(401).json({
                 success: false,
-                message: "Invalid reCAPTCHA"
+                message: "Invalid reCAPTCHA or score too low",
+                googleError: data["error-codes"],
+                score: data.score
             });
         }
 
@@ -90,10 +94,13 @@ const signIn = async (req, res) => {
             }
         });
         const data = response?.data;
-        if (!data?.success) {
+        console.log("Google ReCAPTCHA verification response (signin):", data);
+        if (!data?.success || data.score < 0.5) {
             return res.status(401).json({
                 success: false,
-                message: "Invalid reCAPTCHA"
+                message: "Invalid reCAPTCHA or score too low",
+                googleError: data["error-codes"],
+                score: data.score
             });
         }
 
@@ -111,11 +118,12 @@ const signIn = async (req, res) => {
                 message: "Invalid credentials"
             });
         }
+
         const payload = {
             id: user._id,
             email: user.email,
             role: user.role
-        }
+        };
         const accessToken = generateToken.accessToken(payload);
         const refreshToken = generateToken.refreshToken(payload);
 
@@ -134,9 +142,10 @@ const signIn = async (req, res) => {
             sameSite: process.env.NODE_ENV === "development" ? "lax" : "strict",
             maxAge: 7 * 24 * 60 * 60 * 1000
         });
+
         return res.status(200).json({
             success: true,
-            message: "User logged in successfully",
+            message: "User signed in successfully",
             user
         });
     } catch (error) {
@@ -146,6 +155,90 @@ const signIn = async (req, res) => {
         })
     }
 };
+
+const verify2FAEmailClick = async (req, res) => {
+    try {
+        const { token, choice } = req.query;
+        if (!token || !choice) return res.status(400).send("Invalid request");
+        
+        const decoded = jwt.verify(token, process.env.ACCESS_TOKEN_SECRET);
+        if (decoded.purpose !== "2fa") return res.status(400).send("Invalid token purpose");
+
+        const user = await User.findById(decoded.id);
+        if (!user || user.twoFactorChallenge === null) {
+            return res.status(400).send("<h2>2FA session expired or invalid</h2>");
+        }
+        
+        if (new Date() > user.twoFactorExpiresAt) {
+            return res.status(400).send("<h2>2FA session expired. Please log in again.</h2>");
+        }
+
+        if (parseInt(choice) === user.twoFactorChallenge) {
+            user.is2FaVerified = true;
+            user.twoFactorChallenge = null;
+            await user.save();
+            return res.status(200).send("<h2>Verification Successful! ✅</h2><p>You can return to your original device. It will automatically log you in.</p>");
+        } else {
+            return res.status(400).send("<h2>Verification Failed ❌</h2><p>You tapped the wrong number. For security, please try logging in again.</p>");
+        }
+    } catch (error) {
+        return res.status(500).send("<h2>Error verifying 2FA. Link might be expired.</h2>");
+    }
+};
+
+const poll2FAStatus = async (req, res) => {
+    try {
+        const { tempToken } = req.body;
+        if (!tempToken) return res.status(401).json({ success: false, message: "Missing temp token" });
+        
+        const decoded = jwt.verify(tempToken, process.env.ACCESS_TOKEN_SECRET);
+        const user = await User.findById(decoded.id);
+        
+        if (!user) return res.status(401).json({ success: false, message: "User not found" });
+
+        if (user.is2FaVerified) {
+            // Success! Issue the real tokens
+            user.is2FaVerified = false; // Reset for next time
+            
+            const payload = { id: user._id, email: user.email, role: user.role };
+            const accessToken = generateToken.accessToken(payload);
+            const refreshToken = generateToken.refreshToken(payload);
+
+            user.refreshToken = refreshToken;
+            await user.save();
+
+            res.cookie("accessToken", accessToken, {
+                httpOnly: true,
+                secure: process.env.NODE_ENV === "development" ? false : true,
+                sameSite: process.env.NODE_ENV === "development" ? "lax" : "strict",
+                maxAge: 24 * 60 * 60 * 1000
+            });
+            res.cookie("refreshToken", refreshToken, {
+                httpOnly: true,
+                secure: process.env.NODE_ENV === "development" ? false : true,
+                sameSite: process.env.NODE_ENV === "development" ? "lax" : "strict",
+                maxAge: 7 * 24 * 60 * 60 * 1000
+            });
+            
+            return res.status(200).json({
+                success: true,
+                isVerified: true,
+                message: "2FA verified! Logged in successfully.",
+                user
+            });
+        } else {
+            // Still waiting for the user to click the email
+            return res.status(202).json({
+                success: true,
+                isVerified: false,
+                message: "Waiting for 2FA verification..."
+            });
+        }
+    } catch (error) {
+        return res.status(401).json({ success: false, message: "Session expired." });
+    }
+};
+
 
 const logOut = async (req, res) => {
     try {
@@ -255,5 +348,7 @@ module.exports = {
     signIn,
     logOut,
     authMe,
-    refreshToken
+    refreshToken,
+    verify2FAEmailClick,
+    poll2FAStatus
 };
